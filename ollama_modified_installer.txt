@@ -1,0 +1,144 @@
+#!/bin/sh
+# Modified script to install Ollama in user directory without system modifications
+# Detects but does not modify GPU configuration.
+# - YOU BETTER EDIT LINE 10 at the VERY least before running this.
+# - rename it to {whatever}.sh  
+# - chmod it to executable.  
+
+# Set installation directory to user's bin or symlink it once installed
+# I personally drop apps in a drive, and symlink their binaries to my `~/bin`  dir.
+BINDIR="/media/rl/zulu/100-ai/ollama4"
+
+
+
+set -eu
+
+red="$( (/usr/bin/tput bold || :; /usr/bin/tput setaf 1 || :) 2>&-)"
+plain="$( (/usr/bin/tput sgr0 || :) 2>&-)"
+
+status() { echo ">>> $*" >&2; }
+error() { echo "${red}ERROR:${plain} $*"; exit 1; }
+warning() { echo "${red}WARNING:${plain} $*"; }
+
+TEMP_DIR=$(mktemp -d)
+cleanup() { rm -rf $TEMP_DIR; }
+trap cleanup EXIT
+
+available() { command -v $1 >/dev/null; }
+require() {
+    local MISSING=''
+    for TOOL in $*; do
+        if ! available $TOOL; then
+            MISSING="$MISSING $TOOL"
+        fi
+    done
+    echo $MISSING
+}
+
+[ "$(uname -s)" = "Linux" ] || error 'This script is intended to run on Linux only.'
+
+
+
+OLLAMA_INSTALL_DIR="$BINDIR"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) error "Unsupported architecture: $ARCH" ;;
+esac
+
+# Check for WSL2
+IS_WSL2=false
+KERN=$(uname -r)
+case "$KERN" in
+    *icrosoft*WSL2 | *icrosoft*wsl2) IS_WSL2=true;;
+    *icrosoft) error "Microsoft WSL1 is not currently supported. Please use WSL2 with 'wsl --set-version <distro> 2'" ;;
+    *) ;;
+esac
+
+VER_PARAM="${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}"
+
+# Check for required tools
+NEEDS=$(require curl awk grep sed tee xargs)
+if [ -n "$NEEDS" ]; then
+    status "ERROR: The following tools are required but missing:"
+    for NEED in $NEEDS; do
+        echo "  - $NEED"
+    done
+    exit 1
+fi
+
+
+
+# Create installation directory if it doesn't exist
+if [ ! -d "$BINDIR" ]; then
+    install -d "$BINDIR"
+fi
+
+status "Installing ollama to $OLLAMA_INSTALL_DIR"
+
+# Download and extract ollama
+status "Downloading Linux ${ARCH} bundle"
+curl --fail --show-error --location --progress-bar \
+    "https://ollama.com/download/ollama-linux-${ARCH}.tgz${VER_PARAM}" | \
+    tar -xzf - -C "$OLLAMA_INSTALL_DIR"
+
+install_success() {
+    status 'The Ollama API will be available at 127.0.0.1:11434 when running.'
+    status "Install complete. Run \"$BINDIR/ollama\" to start."
+}
+trap install_success EXIT
+
+# GPU Detection (no modification)
+if [ "$IS_WSL2" = true ]; then
+    if available nvidia-smi && [ -n "$(nvidia-smi | grep -o "CUDA Version: [0-9]*\.[0-9]*")" ]; then
+        status "Nvidia GPU detected and configured."
+    fi
+    install_success
+    exit 0
+fi
+
+# Check for existing GPU setup
+if check_gpu nvidia-smi; then
+    status "NVIDIA GPU detected and configured."
+    exit 0
+fi
+
+# Simple GPU detection without modification
+check_gpu() {
+    case $1 in
+        lspci)
+            case $2 in
+                nvidia) available lspci && lspci -d '10de:' | grep -q 'NVIDIA' || return 1 ;;
+                amdgpu) available lspci && lspci -d '1002:' | grep -q 'AMD' || return 1 ;;
+            esac ;;
+        lshw)
+            case $2 in
+                nvidia) available lshw && lshw -c display -numeric -disable network 2>/dev/null | grep -q 'vendor: .* \[10DE\]' || return 1 ;;
+                amdgpu) available lshw && lshw -c display -numeric -disable network 2>/dev/null | grep -q 'vendor: .* \[1002\]' || return 1 ;;
+            esac ;;
+        nvidia-smi) available nvidia-smi || return 1 ;;
+    esac
+}
+
+# Detect GPU type without installing anything
+if check_gpu nvidia-smi; then
+    status "NVIDIA GPU detected and ready."
+    install_success
+    exit 0
+fi
+
+if check_gpu lspci nvidia || check_gpu lshw nvidia; then
+    status "NVIDIA GPU detected but drivers may need configuration."
+    install_success
+    exit 0
+fi
+
+if check_gpu lspci amdgpu || check_gpu lshw amdgpu; then
+    status "AMD GPU detected."
+    install_success
+    exit 0
+fi
+
+status "No GPU detected. Ollama will run in CPU-only mode."
+install_success
